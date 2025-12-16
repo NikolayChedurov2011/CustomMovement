@@ -2,42 +2,94 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/CharacterMovementComponent.h"
-//#include "GameFramework/CharacterMovementReplication.h"
 
 #include "CustomMovementTypes.h"
 #include "Modifier/ModifierTypes.h"
-#include "Tags/CM_GameplayTags.h"
+#include "Modifier/ModifierImpl.h"
 
 #include "CustomMovementComponent.generated.h"
 
-class FPredictedSavedMove;
+//class FPredictedSavedMove;
 
-struct FCM_NetworkMoveData : public FCharacterNetworkMoveData
+using TMod_Local = FMovementModifier_LocalPredicted;
+using TMod_LocalCorrection = FMovementModifier_WithCorrection;
+using TMod_Server = FMovementModifier_WithCorrection;
+
+struct CUSTOMMOVEMENT_API FPredictedMoveResponseDataContainer : FCharacterMoveResponseDataContainer
 {
-public:
+	// Server ➜ Client
+	using Super = FCharacterMoveResponseDataContainer;
 
-	using Super = FCharacterNetworkMoveData;
+	float Stamina;
+	bool bStaminaDrained;
+
+	/*
+	 * Used by the server to send Modifier data to the client
+	 * LocalPredicted modifiers are not sent, as the server does not correct input states
+	 */
 	
-	uint8 SavedHasteLevel    = NO_MODIFIER;
-	uint8 SavedSlowLevel     = NO_MODIFIER;
-	uint8 SavedSlowFallLevel = NO_MODIFIER;
+	FModifierMoveResponse HasteCorrection;		// Haste
+	FModifierMoveResponse SlowCorrection; 		// Slow
+	FModifierMoveResponse SlowFallCorrection; 	// SlowFall
+
+	/** Tell the client how much location authority they have */
+		float ClientAuthAlpha = 0.f;
+
+	/** No need to send the float if the client has no authority */
+	bool bHasClientAuthAlpha;
+
+	virtual void ServerFillResponseData(const UCharacterMovementComponent& CharacterMovement, const FClientAdjustment& PendingAdjustment) override;
+	virtual bool Serialize(UCharacterMovementComponent& CharacterMovement, FArchive& Ar, UPackageMap* PackageMap) override;
+};
+
+struct FPredictedNetworkMoveData : public FCharacterNetworkMoveData
+{
+	using Super = FCharacterNetworkMoveData;
+ 
+	FPredictedNetworkMoveData()
+		: Stamina(0)
+	{}
+
+	/**
+	 * Extra set of compressed move flags for additional movement states
+	 * Because otherwise CompressedFlags only has FLAG_Reserved_1 remaining
+	 * @note FLAGEX_Custom_0, FLAGEX_Custom_1, FLAGEX_Custom_2 are available for use by the game, however they may be used in the future
+	 * @see FPredictedSavedMove::CompressedFlagsExtra
+	 */
+	uint8 CompressedMoveFlagsExtra;
+
+	float Stamina;
+
+	/*
+	 * Used by the client to send Modifier data to the server
+	 * If local predicted, this data is based on player input, and the server will apply it
+	 * Otherwise, the server will compare the client and server data to know when to send a correction
+	 */
+	
+	FModifierMoveData_LocalPredicted HasteLocal; 			// Haste
+	FModifierMoveData_WithCorrection HasteCorrection; 		// Haste
+	FModifierMoveData_LocalPredicted SlowLocal; 			// Slow
+	FModifierMoveData_WithCorrection SlowCorrection;		// Slow
+	FModifierMoveData_LocalPredicted SlowFallLocal; 		// SlowFall
+	FModifierMoveData_WithCorrection SlowFallCorrection;	// SlowFall
 
 	virtual void ClientFillNetworkMoveData(const FSavedMove_Character& ClientMove, ENetworkMoveType MoveType) override;
 	virtual bool Serialize(UCharacterMovementComponent& Movement, FArchive& Ar, UPackageMap* PackageMap, ENetworkMoveType MoveType) override;
 };
 
-struct FCM_NetworkMoveDataContainer : public FCharacterNetworkMoveDataContainer
+struct FPredictedNetworkMoveDataContainer : public FCharacterNetworkMoveDataContainer
 {
 	using Super = FCharacterNetworkMoveDataContainer;
 	
-	FCM_NetworkMoveData MoveData[3];
-
-	FCM_NetworkMoveDataContainer()
+	FPredictedNetworkMoveDataContainer()
 	{
 		NewMoveData     = &MoveData[0];
 		PendingMoveData = &MoveData[1];
 		OldMoveData     = &MoveData[2];
 	}
+
+private:
+	FPredictedNetworkMoveData MoveData[3];
 };
 
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
@@ -45,15 +97,6 @@ class CUSTOMMOVEMENT_API UCustomMovementComponent : public UCharacterMovementCom
 {
 	GENERATED_BODY()
 
-public:
-	virtual FCharacterNetworkMoveDataContainer& GetNetworkMoveDataContainer()
-	{
-		return CM_MoveDataContainer;
-	}
-
-private:
-	FCM_NetworkMoveDataContainer CM_MoveDataContainer;
-	
 public:
 	/** Max Acceleration (rate of change of velocity) */
 	UPROPERTY(Category="Character Movement (General Settings)", EditAnywhere, BlueprintReadWrite, meta=(ClampMin="0", UIMin="0"))
@@ -231,20 +274,15 @@ public:
 	
 protected:
 	/** THIS SHOULD ONLY BE MODIFIED IN DERIVED CLASSES FROM OnStaminaChanged AND NOWHERE ELSE */
-	UPROPERTY(ReplicatedUsing = OnRep_Stamina)
+	UPROPERTY()
 	float Stamina;
 
 private:
-	UPROPERTY(ReplicatedUsing = OnRep_MaxStamina)
+	UPROPERTY()
 	float MaxStamina;
 
 	UPROPERTY()
 	bool bStaminaDrained;
-
-	UFUNCTION()
-	void OnRep_Stamina();
-	UFUNCTION()
-	void OnRep_MaxStamina();
 
 public:
 	/**
@@ -276,6 +314,16 @@ public:
 	UPROPERTY()
 	TArray<FGameplayTag> HasteLevels;
 
+	/** The method used to calculate Haste levels */
+	UPROPERTY(Category="Character Movement: Modifiers", EditAnywhere, BlueprintReadWrite)
+	EModifierLevelMethod HasteLevelMethod;
+	
+	/** Local Predicted Haste based on Player Input */
+	TMod_Local HasteLocal;
+
+	/** Local Predicted Haste based on Player Input, that can be corrected by the server when a mismatch occurs */
+	TMod_LocalCorrection HasteCorrection;
+	
 public:
 	/**
 	 * Slow modifies movement properties such as speed and acceleration
@@ -301,10 +349,20 @@ public:
 	 */
 	UPROPERTY(Category="Character Movement: Modifiers", EditAnywhere, BlueprintReadWrite, meta=(ClampMin=1, UIMin=1, UIMax=32, EditCondition="bLimitMaxSlows"))
 	int32 MaxSlows = 8;
-
+	
 	/** Indexed list of Slow levels, used to determine the current Slow level based on index */
 	UPROPERTY()
 	TArray<FGameplayTag> SlowLevels;
+	
+	/** The method used to calculate Slow levels */
+	UPROPERTY(Category="Character Movement: Modifiers", EditAnywhere, BlueprintReadWrite)
+	EModifierLevelMethod SlowLevelMethod;
+	
+	/** Local Predicted Slow based on Player Input */
+	TMod_Local SlowLocal;
+
+	/** Local Predicted Slow based on Player Input, that can be corrected by the server when a mismatch occurs */
+	TMod_LocalCorrection SlowCorrection;
 	
 public:
 	/**
@@ -331,10 +389,34 @@ public:
 	 */
 	UPROPERTY(Category="Character Movement: Modifiers", EditAnywhere, BlueprintReadWrite, meta=(ClampMin=1, UIMin=1, UIMax=32, EditCondition="bLimitMaxSlowFalls"))
 	int32 MaxSlowFalls = 8;
-
+	
 	/** Indexed list of SlowFall levels, used to determine the current SlowFall level */
 	UPROPERTY()
 	TArray<FGameplayTag> SlowFallLevels;
+
+	/** The method used to calculate SlowFall levels */
+	UPROPERTY(Category="Character Movement: Modifiers", EditAnywhere, BlueprintReadWrite)
+	EModifierLevelMethod SlowFallLevelMethod;
+
+	/** Local Predicted SlowFall based on Player Input */
+	TMod_Local SlowFallLocal;
+
+	/** Local Predicted SlowFall based on Player Input, that can be corrected by the server when a mismatch occurs */
+	TMod_LocalCorrection SlowFallCorrection;
+
+public:
+	/** Client auth parameters mapped to a source gameplay tag */
+	UPROPERTY(Category="Character Movement (Networking)", EditAnywhere, BlueprintReadOnly)
+	TMap<FGameplayTag, FClientAuthParams> ClientAuthParams;
+
+	UPROPERTY()
+	FClientAuthStack ClientAuthStack;
+
+	UPROPERTY()
+	float ClientAuthAlpha = 0.f;
+
+	UPROPERTY()
+	uint64 ClientAuthIdCounter = 0;
 
 public:
 	UCustomMovementComponent(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
@@ -476,7 +558,6 @@ protected:
 public:
 	/* Haste Implementation */
 
-	UPROPERTY(ReplicatedUsing=OnRep_HasteLevel)
 	uint8 HasteLevel = NO_MODIFIER;
 
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
@@ -492,24 +573,18 @@ public:
 	float GetHasteGroundFrictionScalar() const { return GetHasteParams() ? GetHasteParams()->GroundFriction : 1.f; }
 	float GetHasteBrakingFrictionScalar() const { return GetHasteParams() ? GetHasteParams()->BrakingFriction : 1.f; }
 	bool HasteAffectsRootMotion() const { return GetHasteParams() ? GetHasteParams()->bAffectsRootMotion : false; }
-
-	UFUNCTION()
-	void OnRep_HasteLevel();
 	
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
 	void SetHasteByTag(const FGameplayTag Tag);
 	
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
 	void ClearHaste();
-	
-	//UFUNCTION(Server, Reliable)		void ServerSetHasteLevel(const uint8 NewLevel);
-	//UFUNCTION(Server, Reliable)		void ServerClearHaste();
+
 	/* ~Haste Implementation */
 
 public:
 	/* Slow Implementation */
 	
-	UPROPERTY(ReplicatedUsing=OnRep_SlowLevel)
 	uint8 SlowLevel = NO_MODIFIER;
 
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
@@ -525,9 +600,6 @@ public:
 	float GetSlowGroundFrictionScalar() const { return GetSlowParams() ? GetSlowParams()->GroundFriction : 1.f; }
 	float GetSlowBrakingFrictionScalar() const { return GetSlowParams() ? GetSlowParams()->BrakingFriction : 1.f; }
 	bool SlowAffectsRootMotion() const { return GetSlowParams() ? GetSlowParams()->bAffectsRootMotion : false; }
-
-	UFUNCTION()
-	void OnRep_SlowLevel();
 	
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
 	void SetSlowByTag(const FGameplayTag Tag);
@@ -535,14 +607,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
 	void ClearSlow();
 
-	//UFUNCTION(Server, Reliable)		void ServerSetSlowLevel(const uint8 NewLevel);
-	//UFUNCTION(Server, Reliable)		void ServerClearSlow();
 	/* ~Slow Implementation */
 
 public:
 	/* SlowFall Implementation */
 
-	UPROPERTY(ReplicatedUsing=OnRep_SlowFallLevel)
 	uint8 SlowFallLevel = NO_MODIFIER;
 
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
@@ -554,9 +623,6 @@ public:
 
 	virtual float GetSlowFallGravityZScalar() const { return GetSlowFallParams() ? GetSlowFallParams()->GetGravityScalar(Velocity) : 1.f; }
 	virtual bool RemoveVelocityZOnSlowFallStart() const;
-
-	UFUNCTION()
-	void OnRep_SlowFallLevel();
 	
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
 	void SetSlowFallByTag(const FGameplayTag Tag);
@@ -564,29 +630,72 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
 	void ClearSlowFalling();
 
-	//UFUNCTION(Server, Reliable)		void ServerSetSlowFallLevel(const uint8 NewLevel);
-	//UFUNCTION(Server, Reliable)		void ServerClearSlowFalling();
 	/* ~SlowFall Implementation */
 
 public:
+	virtual void ProcessModifierMovementState();
 	virtual void UpdateModifierMovementState();
 	
 	virtual void UpdateCharacterStateBeforeMovement(float DeltaSeconds) override;
 	virtual void UpdateCharacterStateAfterMovement(float DeltaSeconds) override;
 
+public:
+	/* ~Client Auth Implementation */
+	
+	virtual FClientAuthData* ProcessClientAuthData();
+	FClientAuthParams* GetClientAuthParamsForSource(const FGameplayTag& Source) { return ClientAuthParams.Find(Source); }
+	virtual FClientAuthParams GetClientAuthParams(const FClientAuthData* ClientAuthData);
+
+protected:
+	/**
+	 * Called when the client's position is rejected by the server entirely due to excessive difference
+	 * @param ClientLoc The client's location
+	 * @param ServerLoc The server's location
+	 * @param LocDiff The difference between the client and server locations
+	 */
+	virtual void OnClientAuthRejected(const FVector& ClientLoc, const FVector& ServerLoc, const FVector& LocDiff) {}
+
+	
+public:
+	/** 
+	 * Grant the client position authority, based on the current state of the character.
+	 * @param ClientAuthSource What the client is requesting authority for, not used by default, requires override
+	 * @param OverrideDuration Override the default client authority time, -1.f to use default
+	 */
+	virtual void GrantClientAuthority(FGameplayTag ClientAuthSource, float OverrideDuration = -1.f);
+
+protected:
+	virtual bool ServerShouldGrantClientPositionAuthority(FVector& ClientLoc, FClientAuthData*& AuthData);
+	
+	/* ~Client Auth Implementation */
+	
 protected:
 	virtual bool ServerCheckClientError(float ClientTimeStamp, float DeltaTime, const FVector& Accel,
 		const FVector& ClientWorldLocation, const FVector& RelativeClientLocation,
 		UPrimitiveComponent* ClientMovementBase, FName ClientBaseBoneName, uint8 ClientMovementMode) override;
+
+	virtual void ServerMoveHandleClientError(float ClientTimeStamp, float DeltaTime, const FVector& Accel,
+		const FVector& RelativeClientLocation, UPrimitiveComponent* ClientMovementBase, FName ClientBaseBoneName,
+		uint8 ClientMovementMode) override;
+
+public:
+	virtual void ClientAdjustPosition_Implementation(float TimeStamp, FVector NewLoc, FVector NewVel,
+		UPrimitiveComponent* NewBase, FName NewBaseBoneName, bool bHasBase, bool bBaseRelativePosition,
+		uint8 ServerMovementMode, TOptional<FRotator> OptionalRotation = TOptional<FRotator>()) override;
 
 protected:
 	virtual void OnClientCorrectionReceived(class FNetworkPredictionData_Client_Character& ClientData, float TimeStamp,
 		FVector NewLocation, FVector NewVelocity, UPrimitiveComponent* NewBase, FName NewBaseBoneName, bool bHasBase,
 		bool bBaseRelativePosition, uint8 ServerMovementMode, FVector ServerGravityDirection) override;
 
+	virtual bool ClientUpdatePositionAfterServerUpdate() override;
+	
 protected:
 	virtual void TickCharacterPose(float DeltaTime) override;  // ACharacter::GetAnimRootMotionTranslationScale() is non-virtual so we have to duplicate this entire function
 
+private:
+	FPredictedNetworkMoveDataContainer PredMoveDataContainer;
+	FPredictedMoveResponseDataContainer PredMoveResponseDataContainer;
 	
 public:
 	/** Get prediction data for a client game. Should not be used if not running as a client. Allocates the data on demand and can be overridden to allocate a custom override if desired. Result must be a FNetworkPredictionData_Client_Character. */
@@ -594,11 +703,13 @@ public:
 
 protected:
 	virtual void MoveAutonomous(float ClientTimeStamp, float DeltaTime, uint8 CompressedFlags, const FVector& NewAccel) override;
+
+	/** Unpack compressed flags from a saved move and set state accordingly. See FPredictedSavedMove. */
+	virtual void UpdateFromCompressedFlagsExtra(uint8 Flags);
+
+public:
+	virtual void ServerMove_PerformMovement(const FCharacterNetworkMoveData& MoveData) override;
 	
-protected:
-	virtual void UpdateFromCompressedFlags(uint8 Flags) override;
-
-
 public:
 
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
@@ -612,21 +723,11 @@ public:
 	
 	UFUNCTION(BlueprintCallable, Category="Custom Character Movement")
 	void EndWalk();
-
-protected:
-	virtual void GetLifetimeReplicatedProps(TArray<class FLifetimeProperty>& OutLifetimeProps) const override;
 	
 private:
 
-	UPROPERTY(ReplicatedUsing = OnRep_IsSprinting)
 	bool bIsSprinting {false};
-	UPROPERTY(ReplicatedUsing = OnRep_IsWalking)
 	bool bIsWalking {false};
-
-	UFUNCTION()
-	void OnRep_IsSprinting();
-	UFUNCTION()
-	void OnRep_IsWalking();
 };
 
 
@@ -658,13 +759,21 @@ public:
 	
 	float StartStamina;
 	float EndStamina;
+
+	// Movement Modifiers
+	FModifierSavedMove HasteLocal;							// Haste
+	FModifierSavedMove_WithCorrection HasteCorrection;		// Haste
+	FModifierSavedMove SlowLocal;							// Slow
+	FModifierSavedMove_WithCorrection SlowCorrection;		// Slow
+	FModifierSavedMove SlowFallLocal; 						// SlowFall
+	FModifierSavedMove_WithCorrection SlowFallCorrection;	// SlowFall
 	
 	uint8 HasteLevel = NO_MODIFIER;
 	uint8 SlowLevel = NO_MODIFIER;
 	uint8 SlowFallLevel = NO_MODIFIER;
 
 	// Bit masks used by GetCompressedFlags() to encode movement information.
-	/*enum CompressedFlagsExtra
+	enum CompressedFlagsExtra
 	{
 		FLAGEX_Walk			= 0x01,
 		FLAGEX_Sprint		= 0x02,
@@ -675,26 +784,29 @@ public:
 		FLAGEX_Custom_3		= 0x08,
 		FLAGEX_Custom_4		= 0x10,
 		FLAGEX_Custom_5		= 0x80,
-	};*/
+	};
 
-	enum CompressedFlags
+	/*enum CompressedFlags
 	{
 		FLAG_Walk			= 0x10,
 		FLAG_Sprint			= 0x20,
 		FLAG_Custom_2		= 0x40,
 		FLAG_Custom_3		= 0x80,
-	};
+	};*/
 
 	/** Returns a byte containing encoded special movement information (jumping, crouching, etc.)	 */
-	//virtual uint8 GetCompressedFlagsExtra() const;
+	virtual uint8 GetCompressedFlagsExtra() const;
 	
-	virtual uint8 GetCompressedFlags() const override;
+	//virtual uint8 GetCompressedFlags() const override;
 	
 	/** Clear saved move properties, so it can be re-used. */
 	virtual void Clear() override;
 		
 	/** Returns true if this move can be combined with NewMove for replication without changing any behavior */
 	virtual bool CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* InCharacter, float MaxDelta) const override;
+
+	/** Set the properties describing the position, etc. of the moved pawn at the start of the move. */
+	virtual void SetInitialPosition(ACharacter* C) override;
 
 	/** Called to set up this saved move (when initially created) to make a predictive correction. */
 	virtual void SetMoveFor(ACharacter* C, float InDeltaTime, FVector const& NewAccel, class FNetworkPredictionData_Client_Character & ClientData) override;
@@ -706,6 +818,9 @@ public:
 
 	/** Combine this move with an older move and update relevant state. */
 	virtual void CombineWith(const FSavedMove_Character* OldMove, ACharacter* InCharacter, APlayerController* PC, const FVector& OldStartLocation) override;
+
+	/** Returns true if this move is an "important" move that should be sent again if not acked by the server */
+	virtual bool IsImportantMove(const FSavedMovePtr& LastAckedMove) const override;
 
 };
 
