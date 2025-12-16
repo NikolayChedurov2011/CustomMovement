@@ -1102,8 +1102,7 @@ void FPredictedSavedMove::Clear()
 	SlowFallLevel = NO_MODIFIER;
 }
 
-bool FPredictedSavedMove::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* InCharacter,
-	float MaxDelta) const
+bool FPredictedSavedMove::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* InCharacter,	float MaxDelta) const
 {
 	// We combine moves for the purpose of reducing the number of moves sent to the server, especially when exceeding
 	// 60 fps (by default, see ClientNetSendMoveDeltaTime).
